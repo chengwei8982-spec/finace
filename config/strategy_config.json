@@ -1,0 +1,41 @@
+{
+  "risk": {
+    "max_total_position": 0.35,
+    "max_single_position": 0.12,
+    "stop_loss_pct_default": 0.04,
+    "pause_after_consecutive_losses": 3,
+    "forbid_gap_up_pct": 0.07,
+    "min_stock_score": 70,
+    "max_candidates": 5
+  },
+  "sector_scoring": {
+    "return_weight": 1.5,
+    "volume_weight": 0.08,
+    "leader_weight": 1.2,
+    "breadth_weight": 10.0,
+    "top_sector_min_score": 6.0,
+    "avoid_sector_max_score": 2.0
+  },
+  "market_regime": {
+    "qqq_strong": 0.7,
+    "qqq_weak": -0.7,
+    "spy_strong": 0.4,
+    "spy_weak": -0.4,
+    "turnover_strong": 5.0,
+    "turnover_weak": -5.0,
+    "breadth_strong": 1.2,
+    "breadth_weak": 0.8,
+    "high_beta_damage_alert": 0.5,
+    "volatility_alert": 3.0,
+    "trend_strong_score": 2.2,
+    "trend_moderate_score": 0.8,
+    "risk_off_score": -0.8,
+    "panic_score": -2.2
+  },
+  "backtest": {
+    "period": "12mo",
+    "holding_days": 1,
+    "warmup_bars": 30,
+    "min_recommendations": 1
+  }
+}
