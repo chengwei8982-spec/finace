@@ -25,12 +25,19 @@ Optional live mode:
 
 Optional custom watchlist:
     python stock_agent_mvp.py --live --watchlist NVDA AMD AVGO TSM ASML MSFT META SMCI
+
+Optional external config:
+    python stock_agent_mvp.py --config config/strategy_config.json
+
+Backtest (live dependencies required):
+    python stock_agent_mvp.py --backtest --live
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 from dataclasses import asdict, dataclass, field
@@ -66,18 +73,79 @@ SECTOR_PROXY = {
     "industrial": ["DIA"],
 }
 
-RISK_CONFIG = {
-    "max_total_position": 0.35,
-    "max_single_position": 0.12,
-    "stop_loss_pct_default": 0.04,
-    "pause_after_consecutive_losses": 3,
-    "forbid_gap_up_pct": 0.07,
-    "min_stock_score": 70,
-    "max_candidates": 5,
+DEFAULT_APP_CONFIG = {
+    "risk": {
+        "max_total_position": 0.35,
+        "max_single_position": 0.12,
+        "stop_loss_pct_default": 0.04,
+        "pause_after_consecutive_losses": 3,
+        "forbid_gap_up_pct": 0.07,
+        "min_stock_score": 70,
+        "max_candidates": 5,
+    },
+    "sector_scoring": {
+        "return_weight": 1.5,
+        "volume_weight": 0.08,
+        "leader_weight": 1.2,
+        "breadth_weight": 10.0,
+        "top_sector_min_score": 6.0,
+        "avoid_sector_max_score": 2.0,
+    },
+    "market_regime": {
+        "qqq_strong": 0.7,
+        "qqq_weak": -0.7,
+        "spy_strong": 0.4,
+        "spy_weak": -0.4,
+        "turnover_strong": 5.0,
+        "turnover_weak": -5.0,
+        "breadth_strong": 1.2,
+        "breadth_weak": 0.8,
+        "high_beta_damage_alert": 0.5,
+        "volatility_alert": 3.0,
+        "trend_strong_score": 2.2,
+        "trend_moderate_score": 0.8,
+        "risk_off_score": -0.8,
+        "panic_score": -2.2,
+    },
+    "backtest": {
+        "period": "12mo",
+        "holding_days": 1,
+        "warmup_bars": 30,
+        "min_recommendations": 1,
+    },
 }
+
+CONFIG_PATH = Path("config/strategy_config.json")
+
+
+def deep_merge(base: Dict, override: Dict) -> Dict:
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def load_app_config(config_path: Path = CONFIG_PATH) -> Dict:
+    if not config_path.exists():
+        return DEFAULT_APP_CONFIG
+    with config_path.open("r", encoding="utf-8") as f:
+        user_config = json.load(f)
+    return deep_merge(DEFAULT_APP_CONFIG, user_config)
+
+
+APP_CONFIG = load_app_config()
+RISK_CONFIG = APP_CONFIG["risk"]
+SECTOR_SCORING_CONFIG = APP_CONFIG["sector_scoring"]
+MARKET_REGIME_CONFIG = APP_CONFIG["market_regime"]
+BACKTEST_CONFIG = APP_CONFIG["backtest"]
 
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("stock_agent_mvp")
 
 
 # =========================
@@ -196,6 +264,19 @@ class DailyPlan:
     risk: Dict
     daily_no_go: List[str]
     reflection: Dict
+
+
+@dataclass
+class BacktestSummary:
+    mode: str
+    period: str
+    days_tested: int
+    days_with_signals: int
+    total_picks: int
+    win_rate: float
+    avg_forward_return_pct: float
+    cumulative_return_pct: float
+    max_drawdown_pct: float
 
 
 # =========================
@@ -404,7 +485,8 @@ def download_ohlcv(tickers: List[str], period: str = "3mo", interval: str = "1d"
                 df.columns = [c[0] for c in df.columns]
             df = df.dropna(how="all")
             result[t] = df.copy()
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to download %s: %s", t, e)
             continue
     return result
 
@@ -616,31 +698,31 @@ class MarketRegimeAgent:
         qqq_ret = market.index_returns.get("QQQ", 0.0)
         spy_ret = market.index_returns.get("SPY", 0.0)
 
-        if qqq_ret > 0.7:
+        if qqq_ret > MARKET_REGIME_CONFIG["qqq_strong"]:
             score += 1.2
             evidence.append(f"QQQ strong at {qqq_ret:.2f}%")
-        elif qqq_ret < -0.7:
+        elif qqq_ret < MARKET_REGIME_CONFIG["qqq_weak"]:
             score -= 1.2
             evidence.append(f"QQQ weak at {qqq_ret:.2f}%")
 
-        if spy_ret > 0.4:
+        if spy_ret > MARKET_REGIME_CONFIG["spy_strong"]:
             score += 0.8
             evidence.append(f"SPY supportive at {spy_ret:.2f}%")
-        elif spy_ret < -0.4:
+        elif spy_ret < MARKET_REGIME_CONFIG["spy_weak"]:
             score -= 0.8
             evidence.append(f"SPY soft at {spy_ret:.2f}%")
 
-        if market.turnover_change_pct > 5:
+        if market.turnover_change_pct > MARKET_REGIME_CONFIG["turnover_strong"]:
             score += 0.8
             evidence.append(f"turnover expanding {market.turnover_change_pct:.2f}%")
-        elif market.turnover_change_pct < -5:
+        elif market.turnover_change_pct < MARKET_REGIME_CONFIG["turnover_weak"]:
             score -= 0.8
             evidence.append(f"turnover contracting {market.turnover_change_pct:.2f}%")
 
-        if market.breadth_ratio > 1.2:
+        if market.breadth_ratio > MARKET_REGIME_CONFIG["breadth_strong"]:
             score += 0.8
             evidence.append(f"breadth healthy at {market.breadth_ratio:.2f}")
-        elif market.breadth_ratio < 0.8:
+        elif market.breadth_ratio < MARKET_REGIME_CONFIG["breadth_weak"]:
             score -= 0.8
             evidence.append(f"breadth weak at {market.breadth_ratio:.2f}")
 
@@ -651,27 +733,27 @@ class MarketRegimeAgent:
             score -= 0.8
             evidence.append("breakdowns dominate breakouts")
 
-        if market.high_beta_damage > 0.5:
+        if market.high_beta_damage > MARKET_REGIME_CONFIG["high_beta_damage_alert"]:
             score -= 0.8
             warning_flags.append("high_beta_damage_rising")
             evidence.append(f"high beta damage elevated at {market.high_beta_damage:.2f}")
 
-        if market.volatility_pct > 3.0:
+        if market.volatility_pct > MARKET_REGIME_CONFIG["volatility_alert"]:
             score -= 0.4
             warning_flags.append("market_volatility_elevated")
             evidence.append(f"volatility elevated at {market.volatility_pct:.2f}%")
 
-        if score >= 2.2:
+        if score >= MARKET_REGIME_CONFIG["trend_strong_score"]:
             regime = "trend_strong"
             permission = "normal_to_aggressive"
-        elif score >= 0.8:
+        elif score >= MARKET_REGIME_CONFIG["trend_moderate_score"]:
             regime = "trend_moderate"
             permission = "normal"
-        elif score > -0.8:
+        elif score > MARKET_REGIME_CONFIG["risk_off_score"]:
             regime = "range_choppy"
             permission = "light_only"
             warning_flags.append("prefer_pullbacks_over_chasing")
-        elif score > -2.2:
+        elif score > MARKET_REGIME_CONFIG["panic_score"]:
             regime = "risk_off"
             permission = "defensive_only"
             warning_flags.append("avoid_aggressive_entries")
@@ -697,10 +779,10 @@ class SectorRotationAgent:
 
         for s in sectors:
             strength = (
-                s.return_pct * 1.5
-                + s.volume_change_pct * 0.08
-                + s.leaders_strength * 1.2
-                + s.breadth * 10.0
+                s.return_pct * SECTOR_SCORING_CONFIG["return_weight"]
+                + s.volume_change_pct * SECTOR_SCORING_CONFIG["volume_weight"]
+                + s.leaders_strength * SECTOR_SCORING_CONFIG["leader_weight"]
+                + s.breadth * SECTOR_SCORING_CONFIG["breadth_weight"]
             )
             scored.append((s, strength))
 
@@ -721,9 +803,9 @@ class SectorRotationAgent:
                 "breadth": sector.breadth,
                 "catalyst_summary": sector.catalyst_summary,
             }
-            if rank <= 3 and score > 6:
+            if rank <= 3 and score > SECTOR_SCORING_CONFIG["top_sector_min_score"]:
                 top_sectors.append(item)
-            elif score < 2:
+            elif score < SECTOR_SCORING_CONFIG["avoid_sector_max_score"]:
                 avoid_sectors.append(
                     {
                         "name": sector.name,
@@ -1000,7 +1082,12 @@ def build_live_inputs(watchlist: List[str]) -> Tuple[MarketFeatures, List[Sector
 
     sector_scores = []
     for s in sectors:
-        score = s.return_pct * 1.5 + s.volume_change_pct * 0.08 + s.leaders_strength * 1.2 + s.breadth * 10.0
+        score = (
+            s.return_pct * SECTOR_SCORING_CONFIG["return_weight"]
+            + s.volume_change_pct * SECTOR_SCORING_CONFIG["volume_weight"]
+            + s.leaders_strength * SECTOR_SCORING_CONFIG["leader_weight"]
+            + s.breadth * SECTOR_SCORING_CONFIG["breadth_weight"]
+        )
         sector_scores.append((s.name, score))
     sector_scores.sort(key=lambda x: x[1], reverse=True)
     sector_ranks = {name: idx + 1 for idx, (name, _) in enumerate(sector_scores)}
@@ -1059,6 +1146,144 @@ def build_daily_plan(mode: str, watchlist: List[str], consecutive_losses: int = 
         daily_no_go=daily_no_go,
         reflection=asdict(reflection),
     )
+
+
+def build_stock_features_from_history(watchlist: List[str], stock_data: Dict[str, "pd.DataFrame"], sector_ranks: Dict[str, int], end_idx: int) -> List[StockFeatures]:
+    rows = []
+    for ticker in watchlist:
+        df = stock_data.get(ticker)
+        if df is None or len(df) <= end_idx or end_idx < 20:
+            continue
+        hist = df.iloc[: end_idx + 1]
+        close = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
+        open_price = float(hist["Open"].iloc[-1])
+        high = float(hist["High"].iloc[-1])
+        low = float(hist["Low"].iloc[-1])
+        closes = hist["Close"].tolist()
+        ma5 = sma(closes, 5)
+        ma10 = sma(closes, 10)
+        ma20 = sma(closes, 20)
+        volume = float(hist["Volume"].iloc[-1])
+        avg_volume_20 = float(hist["Volume"].iloc[-21:-1].mean())
+        volume_ratio = volume / avg_volume_20 if avg_volume_20 > 0 else 1.0
+        prev_20_high = float(hist["High"].iloc[-21:-1].max())
+        breakout_raw = ((close / prev_20_high) - 1) * 100.0
+        breakout_score = clamp(5 + breakout_raw * 2, 0, 10)
+        dist_to_ma10 = abs((close / ma10 - 1) * 100.0) if ma10 else 0
+        pullback_score = clamp(10 - dist_to_ma10, 0, 10)
+        sector = infer_sector_for_ticker(ticker)
+        risk_flags = []
+        gap_pct = (open_price / prev_close - 1) if prev_close > 0 else 0
+        if gap_pct > RISK_CONFIG["forbid_gap_up_pct"]:
+            risk_flags.append(f"gap_up_{round2(gap_pct * 100)}pct")
+        if close < ma20:
+            risk_flags.append("below_ma20")
+        rows.append(
+            StockFeatures(
+                ticker=ticker, close=round2(close), prev_close=round2(prev_close), open_price=round2(open_price),
+                high=round2(high), low=round2(low), ma5=round2(ma5), ma10=round2(ma10), ma20=round2(ma20),
+                volume=round2(volume), avg_volume_20=round2(avg_volume_20), volume_ratio=round2(volume_ratio),
+                breakout_score=round2(breakout_score), pullback_score=round2(pullback_score), sector=sector,
+                sector_rank=sector_ranks.get(sector, 99), news_summary="backtest mode", risk_flags=risk_flags,
+            )
+        )
+    return rows
+
+
+def run_backtest(watchlist: List[str], consecutive_losses: int = 0) -> BacktestSummary:
+    require_live_dependencies()
+    tickers = sorted(set(DEFAULT_INDICES + watchlist + [x for v in SECTOR_PROXY.values() for x in v]))
+    data = download_ohlcv(tickers, period=BACKTEST_CONFIG["period"], interval="1d")
+    index_data = {k: v for k, v in data.items() if k in DEFAULT_INDICES}
+    stock_data = {k: v for k, v in data.items() if k not in DEFAULT_INDICES}
+
+    all_lengths = [len(df) for df in stock_data.values() if len(df) > BACKTEST_CONFIG["warmup_bars"] + BACKTEST_CONFIG["holding_days"]]
+    if not all_lengths:
+        raise RuntimeError("Not enough data for backtest.")
+    max_bars = min(all_lengths)
+    holding_days = int(BACKTEST_CONFIG["holding_days"])
+    warmup = int(BACKTEST_CONFIG["warmup_bars"])
+
+    forward_returns = []
+    daily_curve = [0.0]
+    days_with_signals = 0
+
+    market_agent = MarketRegimeAgent()
+    sector_agent = SectorRotationAgent()
+    stock_agent = StockScoringAgent()
+    risk_agent = RiskAgent(RISK_CONFIG)
+
+    for end_idx in range(warmup, max_bars - holding_days):
+        hist_index = {k: v.iloc[: end_idx + 1] for k, v in index_data.items() if len(v) > end_idx}
+        hist_stock = {k: v.iloc[: end_idx + 1] for k, v in stock_data.items() if len(v) > end_idx}
+        market = build_live_market_features(hist_index, hist_stock)
+        sectors = build_live_sector_features(hist_stock)
+        if not sectors:
+            continue
+        sector_scores = []
+        for s in sectors:
+            score = (
+                s.return_pct * SECTOR_SCORING_CONFIG["return_weight"]
+                + s.volume_change_pct * SECTOR_SCORING_CONFIG["volume_weight"]
+                + s.leaders_strength * SECTOR_SCORING_CONFIG["leader_weight"]
+                + s.breadth * SECTOR_SCORING_CONFIG["breadth_weight"]
+            )
+            sector_scores.append((s.name, score))
+        sector_scores.sort(key=lambda x: x[1], reverse=True)
+        sector_ranks = {name: idx + 1 for idx, (name, _) in enumerate(sector_scores)}
+        stocks = build_stock_features_from_history(watchlist, stock_data, sector_ranks, end_idx)
+
+        market_out = market_agent.run(market)
+        _ = risk_agent.run(market_out, consecutive_losses=consecutive_losses)
+        scored = [stock_agent.run(s, market_out) for s in stocks]
+        scored = sorted(scored, key=lambda x: x.score_total, reverse=True)
+        scored = [s for s in scored if s.score_total >= RISK_CONFIG["min_stock_score"]][: RISK_CONFIG["max_candidates"]]
+
+        if len(scored) < BACKTEST_CONFIG["min_recommendations"]:
+            continue
+
+        days_with_signals += 1
+        period_returns = []
+        for rec in scored:
+            df = stock_data.get(rec.ticker)
+            if df is None or len(df) <= end_idx + holding_days:
+                continue
+            entry = float(df["Close"].iloc[end_idx])
+            exit_ = float(df["Close"].iloc[end_idx + holding_days])
+            period_returns.append((exit_ / entry - 1) * 100.0)
+        if not period_returns:
+            continue
+        day_ret = sum(period_returns) / len(period_returns)
+        forward_returns.append(day_ret)
+        daily_curve.append(daily_curve[-1] + day_ret)
+
+    if not forward_returns:
+        raise RuntimeError("Backtest produced no valid signals.")
+
+    wins = sum(1 for r in forward_returns if r > 0)
+    peak = daily_curve[0]
+    max_dd = 0.0
+    for x in daily_curve:
+        peak = max(peak, x)
+        max_dd = min(max_dd, x - peak)
+
+    summary = BacktestSummary(
+        mode="live_backtest",
+        period=BACKTEST_CONFIG["period"],
+        days_tested=len(forward_returns),
+        days_with_signals=days_with_signals,
+        total_picks=days_with_signals * RISK_CONFIG["max_candidates"],
+        win_rate=round2(wins / len(forward_returns) * 100.0),
+        avg_forward_return_pct=round2(sum(forward_returns) / len(forward_returns)),
+        cumulative_return_pct=round2(sum(forward_returns)),
+        max_drawdown_pct=round2(max_dd),
+    )
+
+    path = OUTPUT_DIR / f"backtest_summary_{today_str()}.json"
+    path.write_text(json.dumps(asdict(summary), indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Backtest summary written to: %s", path)
+    return summary
 
 
 # =========================
@@ -1216,11 +1441,43 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Used by the risk agent to reduce exposure after repeated losses",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(CONFIG_PATH),
+        help="Path to external strategy config JSON",
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run rolling backtest and output summary JSON",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    global APP_CONFIG, RISK_CONFIG, SECTOR_SCORING_CONFIG, MARKET_REGIME_CONFIG, BACKTEST_CONFIG
+    APP_CONFIG = load_app_config(Path(args.config))
+    RISK_CONFIG = APP_CONFIG["risk"]
+    SECTOR_SCORING_CONFIG = APP_CONFIG["sector_scoring"]
+    MARKET_REGIME_CONFIG = APP_CONFIG["market_regime"]
+    BACKTEST_CONFIG = APP_CONFIG["backtest"]
+
+    if args.backtest:
+        summary = run_backtest(args.watchlist, consecutive_losses=args.consecutive_losses)
+        print("=" * 72)
+        print("Backtest Summary")
+        print("=" * 72)
+        for k, v in asdict(summary).items():
+            print(f"{k}: {v}")
+        return
+
     mode = "live" if args.live else "mock"
 
     try:
